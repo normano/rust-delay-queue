@@ -160,7 +160,7 @@ impl<T: Hash + Eq> DelayQueue<T> {
 
         let mut queue = self.shared_data.queue.lock().unwrap();
 
-        return loop {
+        loop {
             match queue.peek() {
                 Some((elem, until)) => {
                     if *until == 0 {
@@ -173,10 +173,11 @@ impl<T: Hash + Eq> DelayQueue<T> {
                     if (-*until) > now {
                         return None;
                     }
-                    Some(queue.pop().unwrap().0)
+
+                    return Some(queue.pop().unwrap().0)
                 }
                 // Signal that there is no element with a duration of zero
-                None => None,
+                None => return None,
             };
         }
     }
