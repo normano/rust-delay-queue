@@ -6,5 +6,5 @@
 mod delayed;
 mod delay_queue;
 
-pub use delayed::{Delay, Delayed};
+pub use delayed::{Delay};
 pub use delay_queue::DelayQueue;

@@ -1,14 +1,5 @@
-use std::time::{Duration, Instant};
-
-/// A value that is delayed until some `Instant`.
-///
-/// The `DelayQueue` only accepts values that implement this trait.
-/// In most situations you do not need to implement this trait yourself. You can use the helper
-/// struct `Delay`.
-pub trait Delayed {
-    /// Returns the `Instant` until which this value is delayed.
-    fn delayed_until(&self) -> Instant;
-}
+use std::time::{Duration};
+use chrono::{DateTime, Utc};
 
 /// Wraps a value that should be delayed.
 ///
@@ -20,22 +11,23 @@ pub trait Delayed {
 /// Basic usage:
 ///
 /// ```
-/// use delay_queue::{Delay, Delayed};
-/// use std::time::{Duration, Instant};
+/// use delay_queue::{Delay};
+/// use std::time::{Duration};
+/// use chrono::Utc;
 ///
 /// let delayed_one_hour = Delay::for_duration(123, Duration::from_secs(3600));
-/// let delayed_now = Delay::until_instant("abc", Instant::now());
+/// let delayed_now = Delay::until_instant("abc", Utc::now());
 ///
 /// assert!(delayed_one_hour.delayed_until() > delayed_now.delayed_until());
 /// assert_eq!(delayed_one_hour.value, 123);
 /// ```
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Delay<T> {
     /// The value that is delayed.
     pub value: T,
 
     /// The `Instant` until which `value` is delayed.
-    until: Instant,
+    pub until: DateTime<Utc>,
 }
 
 impl<T> Delay<T> {
@@ -48,10 +40,11 @@ impl<T> Delay<T> {
     /// ```
     /// use delay_queue::Delay;
     /// use std::time::Instant;
+    /// use chrono::Utc;
     ///
-    /// let delayed_now = Delay::until_instant("abc", Instant::now());
+    /// let delayed_now = Delay::until_instant("abc", Utc::now());
     /// ```
-    pub fn until_instant(value: T, until: Instant) -> Delay<T> {
+    pub fn until_instant(value: T, until: DateTime<Utc>) -> Delay<T> {
         Delay { value, until }
     }
 
@@ -69,12 +62,13 @@ impl<T> Delay<T> {
     /// let delayed_one_hour = Delay::for_duration("abc", Duration::from_secs(3600));
     /// ```
     pub fn for_duration(value: T, duration: Duration) -> Delay<T> {
-        Delay::until_instant(value, Instant::now() + duration)
-    }
-}
+        let now = Utc::now();
+        let dt = now + chrono::Duration::from_std(duration).unwrap();
 
-impl<T> Delayed for Delay<T> {
-    fn delayed_until(&self) -> Instant {
+        return Delay::until_instant(value, dt);
+    }
+
+    pub fn delayed_until(&self) -> DateTime<Utc> {
         self.until
     }
 }
@@ -84,7 +78,7 @@ impl<T: Default> Default for Delay<T> {
     fn default() -> Delay<T> {
         Delay {
             value: Default::default(),
-            until: Instant::now(),
+            until: Utc::now(),
         }
     }
 }
@@ -92,12 +86,13 @@ impl<T: Default> Default for Delay<T> {
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
-    use super::{Delay, Delayed};
+    use super::{Delay};
+    use chrono::Utc;
 
     #[test]
     fn compare_until() {
         let delayed_one_hour = Delay::for_duration(123, Duration::from_secs(3600));
-        let delayed_now = Delay::until_instant("abc", Instant::now());
+        let delayed_now = Delay::until_instant("abc", Utc::now());
 
         assert!(delayed_one_hour.delayed_until() > delayed_now.delayed_until());
     }
@@ -105,7 +100,7 @@ mod tests {
     #[test]
     fn correct_value() {
         let delayed_one_hour = Delay::for_duration(123, Duration::from_secs(3600));
-        let delayed_now = Delay::until_instant("abc", Instant::now());
+        let delayed_now = Delay::until_instant("abc", Utc::now());
 
         assert_eq!(delayed_one_hour.value, 123);
         assert_eq!(delayed_now.value, "abc");

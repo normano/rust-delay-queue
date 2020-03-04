@@ -1,8 +1,12 @@
-use std::collections::BinaryHeap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 use std::cmp::Ordering;
-use delayed::Delayed;
+
+use priority_queue::PriorityQueue;
+
+use std::hash::Hash;
+use crate::Delay;
+use chrono::Utc;
 
 /// A concurrent unbounded blocking queue where each item can only be removed when its delay
 /// expires.
@@ -23,17 +27,18 @@ use delayed::Delayed;
 /// ```no_run
 /// use delay_queue::{Delay, DelayQueue};
 /// use std::time::{Duration, Instant};
+/// use chrono::Utc;
 ///
 /// let mut queue = DelayQueue::new();
 /// queue.push(Delay::for_duration("2nd", Duration::from_secs(5)));
-/// queue.push(Delay::until_instant("1st", Instant::now()));
+/// queue.push(Delay::until_instant("1st", Utc::now()));
 ///
 /// println!("First pop: {}", queue.pop().value);
 /// println!("Second pop: {}", queue.pop().value);
 /// assert!(queue.is_empty());
 /// ```
 #[derive(Debug)]
-pub struct DelayQueue<T: Delayed> {
+pub struct DelayQueue<T: Hash + Eq> {
     /// Points to the data that is shared between instances of the same queue (created by
     /// cloning a queue). Usually the different instances of a queue will live in different
     /// threads.
@@ -45,16 +50,16 @@ pub struct DelayQueue<T: Delayed> {
 /// When a `DelayQueue` is cloned, it's clone will point to the same `DelayQueueSharedData`.
 /// This is done so a queue be used by different threads.
 #[derive(Debug)]
-struct DelayQueueSharedData<T: Delayed> {
+struct DelayQueueSharedData<T: Hash + Eq> {
     /// Mutex protected `BinaryHeap` that holds the items of the queue in the order that they
     /// should be popped.
-    queue: Mutex<BinaryHeap<Entry<T>>>,
+    queue: Mutex<PriorityQueue<T, i64>>,
 
     /// Condition variable that signals when there is a new item at the head of the queue.
     condvar_new_head: Condvar,
 }
 
-impl<T: Delayed> DelayQueue<T> {
+impl<T: Hash + Eq> DelayQueue<T> {
     /// Creates an empty `DelayQueue<T>`.
     ///
     /// # Examples
@@ -64,12 +69,12 @@ impl<T: Delayed> DelayQueue<T> {
     /// ```
     /// use delay_queue::{Delay, DelayQueue};
     ///
-    /// let mut queue : DelayQueue<Delay<i32>>  = DelayQueue::new();
+    /// let mut queue : DelayQueue<T>  = DelayQueue::new();
     /// ```
     pub fn new() -> DelayQueue<T> {
         DelayQueue {
             shared_data: Arc::new(DelayQueueSharedData {
-                queue: Mutex::new(BinaryHeap::new()),
+                queue: Mutex::new(PriorityQueue::new()),
                 condvar_new_head: Condvar::new(),
             }),
         }
@@ -87,12 +92,12 @@ impl<T: Delayed> DelayQueue<T> {
     /// ```
     /// use delay_queue::{Delay, DelayQueue};
     ///
-    /// let mut queue : DelayQueue<Delay<&str>>  = DelayQueue::with_capacity(10);
+    /// let mut queue : DelayQueue<T>  = DelayQueue::with_capacity(10);
     /// ```
     pub fn with_capacity(capacity: usize) -> DelayQueue<T> {
         DelayQueue {
             shared_data: Arc::new(DelayQueueSharedData {
-                queue: Mutex::new(BinaryHeap::with_capacity(capacity)),
+                queue: Mutex::new(PriorityQueue::with_capacity(capacity)),
                 condvar_new_head: Condvar::new(),
             }),
         }
@@ -111,20 +116,20 @@ impl<T: Delayed> DelayQueue<T> {
     /// let mut queue = DelayQueue::new();
     /// queue.push(Delay::for_duration("2nd", Duration::from_secs(5)));
     /// ```
-    pub fn push(&mut self, item: T) {
+    pub fn push(&mut self, item: Delay<T>) {
         let mut queue = self.shared_data.queue.lock().unwrap();
 
         {
             // If the new item goes to the head of the queue then notify consumers
             let cur_head = queue.peek();
             if (cur_head == None)
-                || (item.delayed_until() < cur_head.unwrap().delayed.delayed_until())
+                || (&item.until.timestamp_millis() < cur_head.unwrap().1)
             {
                 self.shared_data.condvar_new_head.notify_one();
             }
         }
 
-        queue.push(Entry::new(item));
+        queue.push(item.value, -item.until.timestamp_millis());
     }
 
     /// Pops the next item from the queue, blocking if necessary until an item is available and its
@@ -137,10 +142,11 @@ impl<T: Delayed> DelayQueue<T> {
     /// ```no_run
     /// use delay_queue::{Delay, DelayQueue};
     /// use std::time::{Duration, Instant};
+    /// use chrono::Utc;
     ///
     /// let mut queue = DelayQueue::new();
     ///
-    /// queue.push(Delay::until_instant("1st", Instant::now()));
+    /// queue.push(Delay::until_instant("1st", Utc::now()));
     ///
     /// // The pop will not block, since the delay has expired.
     /// println!("First pop: {}", queue.pop().value);
@@ -150,41 +156,36 @@ impl<T: Delayed> DelayQueue<T> {
     /// // The pop will block for approximately 5 seconds before returning the item.
     /// println!("Second pop: {}", queue.pop().value);
     /// ```
-    pub fn pop(&mut self) -> T {
+    pub fn pop(&mut self) -> Option<T> {
+
         let mut queue = self.shared_data.queue.lock().unwrap();
 
-        // Loop until an element can be popped, waiting if necessary
-        loop {
-            let wait_duration = match queue.peek() {
-                Some(elem) => {
-                    let now = Instant::now();
-                    // If there is an element and its delay is expired
-                    // break out of the loop to pop it
-                    if elem.delayed.delayed_until() <= now {
-                        break;
-                    }
-                    // Otherwise, calculate the Duration until the element expires
-                    elem.delayed.delayed_until() - now
+        return match queue.peek() {
+            Some((elem, until)) => {
+                let now = Utc::now().timestamp_millis();
+
+                if (-*until) > now {
+                    return None;
                 }
+                Some(queue.pop().unwrap().0)
+            }
+            // Signal that there is no element with a duration of zero
+            None => None,
+        };
+    }
 
-                // Signal that there is no element with a duration of zero
-                None => Duration::from_secs(0),
-            };
+    pub fn remove<F>(&mut self, should_keep_fn: F)
+    where F: Fn(&T, &i64) -> bool
+    {
+        let mut queue = self.shared_data.queue.lock().unwrap();
 
-            // Wait until there is a new head of the queue
-            // or the time to pop the current head expires
-            queue = if wait_duration > Duration::from_secs(0) {
-                self.shared_data
-                    .condvar_new_head
-                    .wait_timeout(queue, wait_duration)
-                    .unwrap()
-                    .0
-            } else {
-                self.shared_data.condvar_new_head.wait(queue).unwrap()
-            };
+        let items = queue.iter_mut();
+
+        for (item, mut priority) in items {
+            if !should_keep_fn(&item, priority) {
+                *priority = 0;
+            }
         }
-
-        self.force_pop(queue)
     }
 
     /// Pops the next item from the queue, blocking if necessary until an item is available and its
@@ -213,7 +214,8 @@ impl<T: Delayed> DelayQueue<T> {
     ///          queue.try_pop_for(Duration::from_secs(5)).unwrap().value); // Prints "1st"
     /// ```
     pub fn try_pop_for(&mut self, timeout: Duration) -> Option<T> {
-        self.try_pop_until(Instant::now() + timeout)
+        //TODO the downcast may be a terrible thing
+        self.try_pop_until(Utc::now().timestamp_millis() + timeout.as_millis() as i64)
     }
 
     /// Pops the next item from the queue, blocking if necessary until an item is available and its
@@ -228,6 +230,7 @@ impl<T: Delayed> DelayQueue<T> {
     /// ```no_run
     /// use delay_queue::{Delay, DelayQueue};
     /// use std::time::{Duration, Instant};
+    /// use chrono::Utc;
     ///
     /// let mut queue = DelayQueue::new();
     ///
@@ -235,29 +238,29 @@ impl<T: Delayed> DelayQueue<T> {
     ///
     /// // The pop will block for approximately 2 seconds before returning None.
     /// println!("First pop: {:?}",
-    ///          queue.try_pop_until(Instant::now() + Duration::from_secs(2))); // Prints "None"
+    ///          queue.try_pop_until(Utc::now().timestamp_millis() + Duration::from_secs(2).as_millis() as i64)); // Prints "None"
     ///
-    /// // The pop will block for approximately 3 seconds before returning the item.
+    /// // The pop will block for approximately 5 seconds before returning the item.
     /// println!("Second pop: {}",
-    ///          queue.try_pop_until(Instant::now() + Duration::from_secs(5))
+    ///          queue.try_pop_until(Utc::now().timestamp_millis() + Duration::from_secs(5).as_millis() as i64)
     ///               .unwrap().value); // Prints "1st"
     /// ```
-    pub fn try_pop_until(&mut self, try_until: Instant) -> Option<T> {
+    pub fn try_pop_until(&mut self, try_until: i64) -> Option<T> {
         let mut queue = self.shared_data.queue.lock().unwrap();
 
         // Loop until an element can be popped or the timeout expires, waiting if necessary
         loop {
-            let now = Instant::now();
+            let now = Utc::now().timestamp_millis();
 
             let next_elem_duration = match queue.peek() {
                 // If there is an element and its delay is expired, break out of the loop to pop it
-                Some(elem) if elem.delayed.delayed_until() <= now => break,
+                Some(elem) if (-*elem.1) <= now => break,
 
                 // Calculate the Duration until the element expires
-                Some(elem) => elem.delayed.delayed_until() - now,
+                Some(elem) => (-*elem.1) - now,
 
                 // Signal that there is no element with a duration of zero
-                None => Duration::from_secs(0),
+                None => 0,
             };
 
             if now >= try_until {
@@ -266,7 +269,7 @@ impl<T: Delayed> DelayQueue<T> {
 
             let time_left = try_until - now;
 
-            let wait_duration = if next_elem_duration > Duration::from_secs(0) {
+            let wait_duration = if next_elem_duration > 0 {
                 // We'll wait until the time to pop the next element is reached
                 // or our timeout expires, whichever comes first
                 next_elem_duration.min(time_left)
@@ -280,7 +283,7 @@ impl<T: Delayed> DelayQueue<T> {
             // or the timeout expires
             queue = self.shared_data
                 .condvar_new_head
-                .wait_timeout(queue, wait_duration)
+                .wait_timeout(queue, Duration::from_millis(wait_duration as u64))
                 .unwrap()
                 .0
         }
@@ -297,9 +300,10 @@ impl<T: Delayed> DelayQueue<T> {
     /// ```
     /// use delay_queue::{Delay, DelayQueue};
     /// use std::time::Instant;
+    /// use chrono::Utc;
     ///
     /// let mut queue = DelayQueue::new();
-    /// queue.push(Delay::until_instant("val", Instant::now()));
+    /// queue.push(Delay::until_instant("val", Utc::now()));
     ///
     /// assert!(!queue.is_empty());
     ///
@@ -318,23 +322,23 @@ impl<T: Delayed> DelayQueue<T> {
     /// # Panics
     ///
     /// Panics if `queue` is empty.
-    fn force_pop(&self, mut queue: MutexGuard<BinaryHeap<Entry<T>>>) -> T {
+    fn force_pop(&self, mut queue: MutexGuard<PriorityQueue<T, i64>>) -> T {
         if queue.len() > 1 {
             self.shared_data.condvar_new_head.notify_one();
         }
 
-        queue.pop().unwrap().delayed
+        queue.pop().unwrap().0
     }
 }
 
-impl<T: Delayed> Default for DelayQueue<T> {
+impl<T: Hash + Eq> Default for DelayQueue<T> {
     /// Creates an empty `DelayQueue<T>`.
     fn default() -> DelayQueue<T> {
         DelayQueue::new()
     }
 }
 
-impl<T: Delayed> Clone for DelayQueue<T> {
+impl<T: Hash + Eq> Clone for DelayQueue<T> {
     /// Returns a new `DelayQueue` that points to the same underlying data.
     ///
     /// This method can be used to share a queue between different threads.
@@ -367,377 +371,5 @@ impl<T: Delayed> Clone for DelayQueue<T> {
         DelayQueue {
             shared_data: self.shared_data.clone(),
         }
-    }
-}
-
-
-/// An entry in the `DelayQueue`.
-///
-/// Holds a `Delayed` item and implements an ordering based on delay `Instant`s of the items.
-#[derive(Debug)]
-struct Entry<T: Delayed> {
-    delayed: T,
-}
-
-impl<T: Delayed> Entry<T> {
-    fn new(delayed: T) -> Entry<T> {
-        Entry { delayed }
-    }
-}
-
-/// Implements ordering for `Entry`, so it can be used to correctly order elements in the
-/// `BinaryHeap` of the `DelayQueue`.
-///
-/// Earlier entries have higher priority (should be popped first), so they are Greater that later
-/// entries.
-impl<T: Delayed> Ord for Entry<T> {
-    fn cmp(&self, other: &Entry<T>) -> Ordering {
-        other
-            .delayed
-            .delayed_until()
-            .cmp(&self.delayed.delayed_until())
-    }
-}
-
-impl<T: Delayed> PartialOrd for Entry<T> {
-    fn partial_cmp(&self, other: &Entry<T>) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<T: Delayed> PartialEq for Entry<T> {
-    fn eq(&self, other: &Entry<T>) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl<T: Delayed> Eq for Entry<T> {}
-
-
-#[cfg(test)]
-mod tests {
-    extern crate timebomb;
-
-    use self::timebomb::timeout_ms;
-    use std::time::{Duration, Instant};
-    use std::thread;
-    use delayed::Delay;
-    use super::{DelayQueue, Entry};
-
-    #[test]
-    fn entry_comparisons() {
-        let delayed_one_hour = Entry::new(Delay::for_duration("abc", Duration::from_secs(3600)));
-        let delayed_now = Entry::new(Delay::for_duration("def", Duration::from_secs(0)));
-
-        assert_eq!(delayed_now, delayed_now);
-        assert_ne!(delayed_now, delayed_one_hour);
-
-        assert!(delayed_now > delayed_one_hour);
-        assert!(delayed_one_hour < delayed_now);
-        assert!(delayed_one_hour <= delayed_one_hour);
-    }
-
-    #[test]
-    fn is_empty() {
-        timeout_ms(
-            || {
-                let mut queue = DelayQueue::new();
-
-                assert!(queue.is_empty());
-
-                queue.push(Delay::until_instant("1st", Instant::now()));
-
-                assert!(!queue.is_empty());
-                assert_eq!(queue.pop().value, "1st");
-                assert!(queue.is_empty());
-            },
-            1000,
-        );
-    }
-
-    #[test]
-    fn push_pop_single_thread() {
-        timeout_ms(
-            || {
-                let mut queue = DelayQueue::new();
-
-                let delay1 = Delay::until_instant("1st", Instant::now());
-                let delay2 = Delay::for_duration("2nd", Duration::from_millis(20));
-                let delay3 = Delay::for_duration("3rd", Duration::from_millis(30));
-                let delay4 = Delay::for_duration("4th", Duration::from_millis(40));
-
-                queue.push(delay2);
-                queue.push(delay4);
-                queue.push(delay1);
-
-                assert_eq!(queue.pop().value, "1st");
-                assert_eq!(queue.pop().value, "2nd");
-
-                queue.push(delay3);
-
-                assert_eq!(queue.pop().value, "3rd");
-                assert_eq!(queue.pop().value, "4th");
-
-                assert!(queue.is_empty());
-            },
-            1000,
-        );
-    }
-
-    #[test]
-    fn push_pop_different_thread() {
-        timeout_ms(
-            || {
-                let mut queue = DelayQueue::new();
-
-                let delay1 = Delay::until_instant("1st", Instant::now());
-                let delay2 = Delay::for_duration("2nd", Duration::from_millis(20));
-                let delay3 = Delay::for_duration("3rd", Duration::from_millis(30));
-                let delay4 = Delay::for_duration("4th", Duration::from_millis(40));
-
-                queue.push(delay2);
-                queue.push(delay3);
-                queue.push(delay1);
-
-                let mut cloned_queue = queue.clone();
-
-                let handle = thread::spawn(move || {
-                    assert_eq!(cloned_queue.pop().value, "1st");
-                    assert_eq!(cloned_queue.pop().value, "2nd");
-                    assert_eq!(cloned_queue.pop().value, "3rd");
-                    assert_eq!(cloned_queue.pop().value, "4th");
-                    assert!(cloned_queue.is_empty());
-                });
-
-                queue.push(delay4);
-
-                handle.join().unwrap();
-
-                assert!(queue.is_empty());
-            },
-            1000,
-        );
-    }
-
-    #[test]
-    fn pop_before_push() {
-        timeout_ms(
-            || {
-                let mut queue: DelayQueue<Delay<&str>> = DelayQueue::new();
-
-                let mut cloned_queue = queue.clone();
-
-                let handle = thread::spawn(move || {
-                    assert_eq!(cloned_queue.pop().value, "1st");
-                    assert!(cloned_queue.is_empty());
-                });
-
-                thread::sleep(Duration::from_millis(100));
-                queue.push(Delay::for_duration("1st", Duration::from_millis(10)));
-
-                handle.join().unwrap();
-
-                assert!(queue.is_empty());
-            },
-            1000,
-        );
-    }
-
-    #[test]
-    fn pop_two_before_push() {
-        timeout_ms(
-            || {
-                let mut queue: DelayQueue<Delay<&str>> = DelayQueue::new();
-                let mut handles = vec![];
-
-                for _ in 0..3 {
-                    let mut queue = queue.clone();
-                    let handle = thread::spawn(move || {
-                        let val = queue.pop().value;
-                        if val == "3rd" {
-                            assert!(queue.is_empty());
-                        }
-                    });
-                    handles.push(handle);
-                }
-
-                thread::sleep(Duration::from_millis(100));
-                queue.push(Delay::for_duration("1st", Duration::from_millis(10)));
-                queue.push(Delay::for_duration("2nd", Duration::from_millis(20)));
-                queue.push(Delay::for_duration("3rd", Duration::from_millis(30)));
-
-                for handle in handles {
-                    handle.join().unwrap();
-                }
-
-                assert!(queue.is_empty());
-            },
-            1000,
-        );
-    }
-
-    #[test]
-    fn push_higher_priority_while_waiting_to_pop() {
-        timeout_ms(
-            || {
-                let mut queue: DelayQueue<Delay<&str>> = DelayQueue::new();
-
-                let delay1 = Delay::until_instant("1st", Instant::now());
-                let delay2 = Delay::for_duration("2nd", Duration::from_millis(100));
-
-                let mut cloned_queue = queue.clone();
-
-                let handle = thread::spawn(move || {
-                    assert_eq!(cloned_queue.pop().value, "1st");
-                    assert_eq!(cloned_queue.pop().value, "2nd");
-                    assert!(cloned_queue.is_empty());
-                });
-
-                thread::sleep(Duration::from_millis(10));
-                queue.push(delay2);
-                thread::sleep(Duration::from_millis(10));
-                queue.push(delay1);
-
-                handle.join().unwrap();
-
-                assert!(queue.is_empty());
-            },
-            1000,
-        );
-    }
-
-    #[test]
-    fn try_pop_until_now() {
-        timeout_ms(
-            || {
-                let mut queue = DelayQueue::new();
-
-                let delay1 = Delay::until_instant("1st", Instant::now());
-                let delay2 = Delay::for_duration("2nd", Duration::from_millis(500));
-
-                queue.push(delay1);
-                queue.push(delay2);
-
-                assert_eq!(queue.try_pop_until(Instant::now()).unwrap().value, "1st");
-                assert_eq!(queue.try_pop_until(Instant::now()), None);
-
-                assert!(!queue.is_empty());
-            },
-            1000,
-        );
-    }
-
-    #[test]
-    fn try_pop_for_zero_duration() {
-        timeout_ms(
-            || {
-                let mut queue = DelayQueue::new();
-
-                let delay1 = Delay::until_instant("1st", Instant::now());
-                let delay2 = Delay::for_duration("2nd", Duration::from_millis(500));
-
-                queue.push(delay1);
-                queue.push(delay2);
-
-                assert_eq!(
-                    queue.try_pop_for(Duration::from_millis(0)).unwrap().value,
-                    "1st"
-                );
-                assert_eq!(queue.try_pop_for(Duration::from_millis(0)), None);
-
-                assert!(!queue.is_empty());
-            },
-            1000,
-        );
-    }
-
-    #[test]
-    fn try_pop_until() {
-        timeout_ms(
-            || {
-                let mut queue = DelayQueue::new();
-
-                let delay1 = Delay::for_duration("1st", Duration::from_millis(100));
-
-                queue.push(delay1);
-
-                assert_eq!(
-                    queue.try_pop_until(Instant::now() + Duration::from_millis(10)),
-                    None
-                );
-                assert_eq!(
-                    queue
-                        .try_pop_until(Instant::now() + Duration::from_millis(200))
-                        .unwrap()
-                        .value,
-                    "1st"
-                );
-
-                assert!(queue.is_empty());
-
-                assert_eq!(
-                    queue.try_pop_until(Instant::now() + Duration::from_millis(10)),
-                    None
-                );
-            },
-            1000,
-        );
-    }
-
-    #[test]
-    fn try_pop_for() {
-        timeout_ms(
-            || {
-                let mut queue = DelayQueue::new();
-
-                let delay1 = Delay::for_duration("1st", Duration::from_millis(100));
-
-                queue.push(delay1);
-
-                assert_eq!(queue.try_pop_for(Duration::from_millis(10)), None);
-                assert_eq!(
-                    queue.try_pop_for(Duration::from_millis(200)).unwrap().value,
-                    "1st"
-                );
-
-                assert!(queue.is_empty());
-
-                assert_eq!(queue.try_pop_for(Duration::from_millis(10)), None);
-            },
-            1000,
-        );
-    }
-
-    #[test]
-    fn push_higher_priority_while_waiting_to_try_pop() {
-        timeout_ms(
-            || {
-                let mut queue = DelayQueue::new();
-
-                let delay1 = Delay::until_instant("1st", Instant::now());
-                let delay2 = Delay::for_duration("2nd", Duration::from_millis(1000));
-
-                queue.push(delay2);
-
-                let mut cloned_queue = queue.clone();
-
-                let handle = thread::spawn(move || {
-                    assert_eq!(
-                        cloned_queue
-                            .try_pop_for(Duration::from_millis(100))
-                            .unwrap()
-                            .value,
-                        "1st"
-                    );
-                    assert!(!cloned_queue.is_empty());
-                });
-
-                thread::sleep(Duration::from_millis(20));
-                queue.push(delay1);
-
-                handle.join().unwrap();
-            },
-            1000,
-        );
     }
 }
