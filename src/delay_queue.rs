@@ -160,20 +160,29 @@ impl<T: Hash + Eq> DelayQueue<T> {
 
         let mut queue = self.shared_data.queue.lock().unwrap();
 
-        return match queue.peek() {
-            Some((elem, until)) => {
-                let now = Utc::now().timestamp_millis();
+        return loop {
+            match queue.peek() {
+                Some((elem, until)) => {
+                    if *until == 0 {
+                        queue.pop(); // Skip removed item
+                        continue;
+                    }
 
-                if (-*until) > now {
-                    return None;
+                    let now = Utc::now().timestamp_millis();
+
+                    if (-*until) > now {
+                        return None;
+                    }
+                    Some(queue.pop().unwrap().0)
                 }
-                Some(queue.pop().unwrap().0)
-            }
-            // Signal that there is no element with a duration of zero
-            None => None,
-        };
+                // Signal that there is no element with a duration of zero
+                None => None,
+            };
+        }
     }
 
+    /// Sets item to be removed item eventually
+    /// should_keep_fn should return true on any items it seeks to keep
     pub fn remove<F>(&mut self, should_keep_fn: F)
     where F: Fn(&T, &i64) -> bool
     {
